@@ -1,0 +1,12 @@
+[project]
+name = "simple-vae"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flax>=0.10.4",
+    "jax[cuda12]>=0.5.3",
+    "matplotlib>=3.10.1",
+    "numpy>=2.2.4",
+]
