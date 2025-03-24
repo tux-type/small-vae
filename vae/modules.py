@@ -1,6 +1,8 @@
 import jax
+import jax.numpy as jnp
 from flax import nnx
-from vae.modules import ConvBlock, DownBlock, UpBlock
+
+from vae.blocks import ConvBlock, DownBlock, UpBlock
 
 
 class Encoder(nnx.Module):
@@ -21,17 +23,13 @@ class Encoder(nnx.Module):
         self.resolution = resolution
         self.num_resolutions = len(feature_multipliers) + 1
 
-        self.image_projection = ConvBlock(
-            in_features, num_features, is_residual=True, rngs=rngs
-        )
+        self.image_projection = ConvBlock(in_features, num_features, is_residual=True, rngs=rngs)
 
         self.down_blocks = []
         in_features_curr = num_features
         for mult in feature_multipliers:
             out_features_curr = mult * num_features
-            self.down_blocks.append(
-                DownBlock(in_features_curr, out_features_curr, rngs=rngs)
-            )
+            self.down_blocks.append(DownBlock(in_features_curr, out_features_curr, rngs=rngs))
             in_features_curr = out_features_curr
 
         self.mid_block = ConvBlock(in_features_curr, in_features_curr, rngs=rngs)
@@ -91,9 +89,7 @@ class Decoder(nnx.Module):
 
         for mult in reversed(feature_multipliers):
             out_features_curr = mult * num_features
-            self.up_blocks.append(
-                UpBlock(in_features_curr, out_features_curr, rngs=rngs)
-            )
+            self.up_blocks.append(UpBlock(in_features_curr, out_features_curr, rngs=rngs))
             in_features_curr = out_features_curr
 
         self.feature_aggregation = nnx.Conv(
@@ -115,3 +111,19 @@ class Decoder(nnx.Module):
 
         out = self.feature_aggregation(h)
         return out
+
+
+class GaussianPosterior:
+    def __init__(self, moments: jax.Array):
+        self.moments = moments
+        self.mean, self.logvar = jnp.split(moments, 2, -1)
+        # Avoid underflow and overflow when exponentiating
+        self.logvar = jnp.clip(self.logvar, -30.0, 20.0)
+        self.var = jnp.exp(self.logvar)
+        self.std = jnp.exp(0.5 * self.logvar)
+
+    def sample(self, rngs: nnx.Rngs):
+        latent = self.mean + self.std * jax.random.normal(
+            rngs.latent(), shape=self.mean.shape
+        ).to_device(self.moments.device)
+        return latent
