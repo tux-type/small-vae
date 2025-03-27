@@ -5,13 +5,14 @@ from vae.modules import Decoder, Encoder, GaussianPosterior
 
 
 class VariationalAutoEncoder(nnx.Module):
-    def __init__(self, encoder: Encoder, decoder: Decoder):
+    def __init__(self, encoder: Encoder, decoder: Decoder, device: jax.Device):
         self.encoder: Encoder = encoder
         self.decoder: Decoder = decoder
+        self.device: jax.Device = device
 
     def __call__(self, x: jax.Array, rngs: nnx.Rngs) -> tuple[GaussianPosterior, jax.Array]:
         posterior = self.encode(x)
-        latent = posterior.sample(rngs=rngs)
+        latent = posterior.sample(rngs=rngs, device=self.device)
         x_hat = self.decode(latent)
         return posterior, x_hat
 
