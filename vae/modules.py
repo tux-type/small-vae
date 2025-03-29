@@ -122,7 +122,7 @@ class GaussianPosterior:
         self.var = jnp.exp(self.logvar)
         self.std = jnp.exp(0.5 * self.logvar)
 
-    def sample(self, rngs: nnx.Rngs, device: jax.Device):
+    def sample(self, rngs: nnx.Rngs, device: jax.Device) -> jax.Array:
         latent = self.mean + self.std * jax.random.normal(
             rngs.latent(), shape=self.mean.shape
         ).to_device(device)

@@ -24,3 +24,9 @@ class VariationalAutoEncoder(nnx.Module):
     def decode(self, latent: jax.Array) -> jax.Array:
         x_hat = self.decoder(latent)
         return x_hat
+
+    def reconstruct(self, x: jax.Array) -> jax.Array:
+        posterior = self.encode(x)
+        latent = posterior.mean
+        x_hat = self.decode(latent)
+        return x_hat

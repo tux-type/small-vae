@@ -32,13 +32,13 @@ def normalise_batch(samples: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 def loss_fn(
     model: VariationalAutoEncoder, x: jax.Array, rngs: nnx.Rngs, beta: float
-) -> tuple[jax.Array, ...]:
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
     posterior, predictions = model(x, rngs)
     kl = -0.5 * jnp.sum(1 + posterior.logvar - (posterior.mean**2) - posterior.var, axis=(1, 2, 3))
-    kl_loss = jnp.mean(kl)
+    kl_loss = kl.sum() / x.shape[0]
     recon_loss = jnp.mean(optax.squared_error(predictions=predictions, targets=x))
     loss = beta * kl_loss + recon_loss
-    return loss, kl_loss, recon_loss, predictions
+    return loss, (kl_loss, recon_loss, predictions)
 
 
 @nnx.jit
@@ -50,7 +50,8 @@ def train_step(
     x: jax.Array,
 ):
     grad_fn = nnx.value_and_grad(f=loss_fn, has_aux=True)
-    (loss, kl_loss, recon_loss, predictions), grads = grad_fn(model, x, rngs)
+    (loss, aux_data), grads = grad_fn(model, x, rngs, beta=0.01)
+    kl_loss, recon_loss, predictions = aux_data
     metrics.update(loss=loss, kl_loss=kl_loss, recon_loss=recon_loss)
     optimiser.update(grads)
 
@@ -61,7 +62,7 @@ def train_mnist(num_epochs: int):
     sampling_rngs = nnx.Rngs(latent=2)
 
     encoder = Encoder(
-        1,
+        in_features=1,
         num_features=128,
         latent_features=4,
         rngs=init_rngs,
@@ -77,12 +78,18 @@ def train_mnist(num_epochs: int):
         resolution=32,
         feature_multipliers=(1, 2, 4),
     )
-    vae = VariationalAutoEncoder(encoder=encoder, decoder=decoder)
+    vae = VariationalAutoEncoder(
+        encoder=encoder,
+        decoder=decoder,
+        device=jax.devices("gpu")[0],
+    )
 
-    dataset = (
+    train_dataset, validation_dataset = (
         ray.data.read_images("data/mnist", override_num_blocks=12)
         .map_batches(normalise_batch)
+        .random_shuffle(seed=42)
         .materialize()
+        .train_test_split(test_size=0.1)
     )
 
     optimiser = nnx.Optimizer(vae, optax.adam(2e-4))
@@ -95,13 +102,13 @@ def train_mnist(num_epochs: int):
     metrics_history = {"loss": [], "kl_loss": [], "recon_loss": []}
 
     for epoch in range(num_epochs):
-        dataset = dataset.random_shuffle().materialize()
+        train_dataset = train_dataset.random_shuffle().materialize()
         progress_bar = tqdm(
-            dataset.iter_batches(
+            train_dataset.iter_batches(
                 prefetch_batches=1, batch_size=128, batch_format="numpy", drop_last=True
             )
         )
-        for i, batch in enumerate(progress_bar):
+        for batch in progress_bar:
             x = jnp.array(batch["image"])[:, :, :, None]
             train_step(vae, optimiser, metrics, training_rngs, x)
 
@@ -114,13 +121,23 @@ def train_mnist(num_epochs: int):
                 f"loss: {loss:.4f} kl_loss: {kl_loss:.4f} recon_loss: {recon_loss:.4f}"
             )
 
-            if (epoch % 5 == 0 or epoch == (num_epochs - 1)) and i == (len(progress_bar) - 1):
-                print(f"Sampling Epoch: {epoch}")
-                _, x_hat = vae(x, rngs=sampling_rngs)
-                x_hat = ((x_hat + 1) * 127.5).clip(0, 255)
-                # Squeeze since grayscale
-                matplotlib.image.imsave(
-                    f"imgs/mnist/image_{epoch}.png",
-                    jnp.concatenate(x_hat, axis=1).squeeze(axis=2).astype(jnp.uint8),
-                    cmap="binary",
-                )
+        if epoch % 5 == 0 or epoch == (num_epochs - 1):
+            print(f"Sampling Epoch: {epoch}")
+            x = jnp.array(validation_dataset.take_batch(8, batch_format="numpy")["image"])[
+                :, :, :, None
+            ]
+            x_hat = vae.reconstruct(x)
+            xs = jnp.concatenate(
+                (jnp.concatenate(x, axis=1), jnp.concatenate(x_hat, axis=1)), axis=0
+            )
+            xs = ((xs + 1) * 127.5).clip(0, 255)
+            # Squeeze since grayscale
+            matplotlib.image.imsave(
+                f"imgs/mnist/image_{epoch}.png",
+                xs.squeeze(axis=2).astype(jnp.uint8),
+                cmap="binary",
+            )
+
+
+if __name__ == "__main__":
+    train_mnist(num_epochs=10)
