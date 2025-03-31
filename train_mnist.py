@@ -9,11 +9,14 @@ logging.getLogger("ray.data").setLevel(logging.WARNING)
 
 ray.init(num_cpus=12, num_gpus=1)
 
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import matplotlib.image
 import numpy as np
 import optax
+import orbax.checkpoint as ocp
 from flax import nnx
 from tqdm import tqdm
 
@@ -24,8 +27,8 @@ from vae.vae import VariationalAutoEncoder
 def normalise_batch(samples: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     data = np.array(samples["image"]).astype(np.float32)
     # Pad from 28x28 to 32x32 for easier downsampling and upsampling
-    data = np.pad(data, ((0, 0), (2, 2), (2, 2)), mode="constant", constant_values=-1)
-    normalised_data = ((data / 255.0) - 0.5) / 0.5
+    data = np.pad(data, ((0, 0), (2, 2), (2, 2)), mode="constant", constant_values=0)
+    normalised_data = data / 255.0
     samples["image"] = normalised_data
     return samples
 
@@ -36,7 +39,10 @@ def loss_fn(
     posterior, predictions = model(x, rngs)
     kl = -0.5 * jnp.sum(1 + posterior.logvar - (posterior.mean**2) - posterior.var, axis=(1, 2, 3))
     kl_loss = kl.sum() / x.shape[0]
-    recon_loss = jnp.mean(optax.squared_error(predictions=predictions, targets=x))
+    recon = jnp.sum(
+        optax.sigmoid_binary_cross_entropy(logits=predictions, labels=x), axis=(1, 2, 3)
+    )
+    recon_loss = recon.sum() / np.prod(x.shape[1:]) / x.shape[0]
     loss = beta * kl_loss + recon_loss
     return loss, (kl_loss, recon_loss, predictions)
 
@@ -50,7 +56,7 @@ def train_step(
     x: jax.Array,
 ):
     grad_fn = nnx.value_and_grad(f=loss_fn, has_aux=True)
-    (loss, aux_data), grads = grad_fn(model, x, rngs, beta=0.01)
+    (loss, aux_data), grads = grad_fn(model, x, rngs, beta=0.0001)
     kl_loss, recon_loss, predictions = aux_data
     metrics.update(loss=loss, kl_loss=kl_loss, recon_loss=recon_loss)
     optimiser.update(grads)
@@ -64,14 +70,14 @@ def train_mnist(num_epochs: int):
     encoder = Encoder(
         in_features=1,
         num_features=128,
-        latent_features=4,
+        latent_features=2,
         rngs=init_rngs,
         resolution=32,
         feature_multipliers=(1, 2, 4),
         double_latent_features=True,
     )
     decoder = Decoder(
-        latent_features=4,
+        latent_features=2,
         num_features=128,
         out_features=1,
         rngs=init_rngs,
@@ -88,7 +94,6 @@ def train_mnist(num_epochs: int):
         ray.data.read_images("data/mnist", override_num_blocks=12)
         .map_batches(normalise_batch)
         .random_shuffle(seed=42)
-        .materialize()
         .train_test_split(test_size=0.1)
     )
 
@@ -123,20 +128,27 @@ def train_mnist(num_epochs: int):
 
         if epoch % 5 == 0 or epoch == (num_epochs - 1):
             print(f"Sampling Epoch: {epoch}")
-            x = jnp.array(validation_dataset.take_batch(8, batch_format="numpy")["image"])[
-                :, :, :, None
-            ]
+            x = jnp.array(validation_dataset.take_batch(8, batch_format="numpy")["image"])
+            x = x[:, :, :, None]
             x_hat = vae.reconstruct(x)
+            # Sigmoid to [0, 1]
+            x_hat = 1 - (1 / (1 + jnp.exp(x_hat)))
             xs = jnp.concatenate(
                 (jnp.concatenate(x, axis=1), jnp.concatenate(x_hat, axis=1)), axis=0
             )
-            xs = ((xs + 1) * 127.5).clip(0, 255)
+            xs = xs * 255
             # Squeeze since grayscale
             matplotlib.image.imsave(
                 f"imgs/mnist/image_{epoch}.png",
                 xs.squeeze(axis=2).astype(jnp.uint8),
                 cmap="binary",
             )
+
+            ckpt_dir = ocp.test_utils.erase_and_create_empty(Path.cwd() / "models" / "mnist")
+            (_, encoder_state), (_, decoder_state) = nnx.split(encoder), nnx.split(decoder)
+            with ocp.StandardCheckpointer() as checkpointer:
+                checkpointer.save(ckpt_dir / "encoder", encoder_state)
+                checkpointer.save(ckpt_dir / "decoder", decoder_state)
 
 
 if __name__ == "__main__":
