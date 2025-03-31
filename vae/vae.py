@@ -1,117 +1,32 @@
 import jax
 from flax import nnx
-from vae.modules import ConvBlock, DownBlock, UpBlock
+
+from vae.modules import Decoder, Encoder, GaussianPosterior
 
 
-class Encoder(nnx.Module):
-    def __init__(
-        self,
-        in_features: int,
-        num_features: int,
-        latent_features: int,
-        rngs: nnx.Rngs,
-        resolution: int,
-        feature_multipliers: tuple[int, ...] = (1, 2, 4),
-        double_latent_features: bool = True,
-    ):
-        self.in_features = in_features
-        self.num_features = num_features
-        self.latent_features = latent_features
+class VariationalAutoEncoder(nnx.Module):
+    def __init__(self, encoder: Encoder, decoder: Decoder, device: jax.Device):
+        self.encoder: Encoder = encoder
+        self.decoder: Decoder = decoder
+        self.device: jax.Device = device
 
-        self.resolution = resolution
-        self.num_resolutions = len(feature_multipliers) + 1
+    def __call__(self, x: jax.Array, rngs: nnx.Rngs) -> tuple[GaussianPosterior, jax.Array]:
+        posterior = self.encode(x)
+        latent = posterior.sample(rngs=rngs, device=self.device)
+        x_hat = self.decode(latent)
+        return posterior, x_hat
 
-        self.image_projection = ConvBlock(
-            in_features, num_features, is_residual=True, rngs=rngs
-        )
+    def encode(self, x: jax.Array) -> GaussianPosterior:
+        moments = self.encoder(x)
+        posterior = GaussianPosterior(moments)
+        return posterior
 
-        self.down_blocks = []
-        in_features_curr = num_features
-        for mult in feature_multipliers:
-            out_features_curr = mult * num_features
-            self.down_blocks.append(
-                DownBlock(in_features_curr, out_features_curr, rngs=rngs)
-            )
-            in_features_curr = out_features_curr
+    def decode(self, latent: jax.Array) -> jax.Array:
+        x_hat = self.decoder(latent)
+        return x_hat
 
-        self.mid_block = ConvBlock(in_features_curr, in_features_curr, rngs=rngs)
-
-        self.feature_aggregation = nnx.Conv(
-            in_features_curr,
-            2 * latent_features if double_latent_features else latent_features,
-            kernel_size=(3, 3),
-            strides=1,
-            padding=1,
-            rngs=rngs,
-        )
-
-    def __call__(self, x: jax.Array) -> jax.Array:
-        h = self.image_projection(x)
-
-        for down_block in self.down_blocks:
-            h = down_block(h)
-
-        h = self.mid_block(h)
-
-        out = self.feature_aggregation(h)
-        return out
-
-
-class Decoder(nnx.Module):
-    def __init__(
-        self,
-        latent_features: int,
-        num_features: int,
-        out_features: int,
-        rngs: nnx.Rngs,
-        resolution: int,
-        feature_multipliers: tuple[int, ...] = (1, 2, 4),
-    ):
-        self.latent_features = latent_features
-        self.num_features = num_features
-        self.out_features = out_features
-
-        self.resolution = resolution
-        self.num_resolutions = len(feature_multipliers) + 1
-        latent_resolution = resolution // (2 ** (self.num_resolutions - 1))
-        self.latent_shape = (1, latent_resolution, latent_resolution, latent_features)
-
-        in_features_curr = num_features * feature_multipliers[-1]
-
-        self.latent_projection = ConvBlock(
-            latent_features,
-            in_features_curr,
-            is_residual=True,
-            rngs=rngs,
-        )
-
-        self.mid_block = ConvBlock(in_features_curr, in_features_curr, rngs=rngs)
-
-        self.up_blocks = []
-
-        for mult in reversed(feature_multipliers):
-            out_features_curr = mult * num_features
-            self.up_blocks.append(
-                UpBlock(in_features_curr, out_features_curr, rngs=rngs)
-            )
-            in_features_curr = out_features_curr
-
-        self.feature_aggregation = nnx.Conv(
-            in_features_curr,
-            out_features,
-            kernel_size=(3, 3),
-            strides=1,
-            padding=1,
-            rngs=rngs,
-        )
-
-    def __call__(self, z: jax.Array) -> jax.Array:
-        h = self.latent_projection(z)
-
-        h = self.mid_block(h)
-
-        for up_block in self.up_blocks:
-            h = up_block(h)
-
-        out = self.feature_aggregation(h)
-        return out
+    def reconstruct(self, x: jax.Array) -> jax.Array:
+        posterior = self.encode(x)
+        latent = posterior.mean
+        x_hat = self.decode(latent)
+        return x_hat
