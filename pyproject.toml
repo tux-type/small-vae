@@ -9,6 +9,8 @@ dependencies = [
     "jax[cuda12]>=0.5.3",
     "matplotlib>=3.10.1",
     "numpy>=2.2.4",
+    "ray[data]>=2.44.1",
+    "tqdm>=4.67.1",
 ]
 
 
