@@ -72,19 +72,14 @@ class DownBlock(nnx.Module):
 class UpBlock(nnx.Module):
     def __init__(self, in_features: int, out_features: int, rngs: nnx.Rngs):
         self.conv = nnx.Sequential(
-            nnx.ConvTranspose(
-                in_features=in_features,
-                out_features=out_features,
-                kernel_size=(2, 2),
-                strides=(2, 2),
-                rngs=rngs,
-            ),
-            ConvBlock(out_features, out_features, rngs=rngs, is_residual=False),
+            ConvBlock(in_features, out_features, rngs=rngs, is_residual=False),
             ConvBlock(out_features, out_features, rngs=rngs, is_residual=False),
         )
 
     def __call__(self, x: jax.Array) -> jax.Array:
-        out = self.conv(x)
+        B, H, W, C = x.shape
+        out = jax.image.resize(x, shape=(B, H * 2, W * 2, C), method="nearest")
+        out = self.conv(out)
         return out
 
 

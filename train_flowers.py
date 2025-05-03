@@ -44,7 +44,7 @@ def crop_resize(img: np.ndarray, size: tuple[int, int] = (32, 32)) -> np.ndarray
 
 
 def normalise_batch(samples: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    data = np.array([crop_resize(image) for image in samples["image"]]).astype(np.float32)
+    data = np.array([crop_resize(image, (64, 64)) for image in samples["image"]]).astype(np.float32)
     normalised_data = ((data / 255.0) - 0.5) / 0.5
     samples["image"] = normalised_data
     return samples
@@ -120,7 +120,7 @@ def train_mnist(num_epochs: int):
         .train_test_split(test_size=0.1)
     )
 
-    optimiser = nnx.Optimizer(vae, optax.adam(2e-5))
+    optimiser = nnx.Optimizer(vae, optax.adam(5e-6))
     metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),
         kl_loss=nnx.metrics.Average("kl_loss"),
@@ -133,7 +133,7 @@ def train_mnist(num_epochs: int):
         train_dataset = train_dataset.random_shuffle().materialize()
         progress_bar = tqdm(
             train_dataset.iter_batches(
-                prefetch_batches=1, batch_size=128, batch_format="numpy", drop_last=True
+                prefetch_batches=1, batch_size=32, batch_format="numpy", drop_last=True
             )
         )
         for batch in progress_bar:
