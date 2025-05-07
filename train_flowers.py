@@ -24,7 +24,7 @@ from vae.modules import Decoder, Encoder
 from vae.vae import VariationalAutoEncoder
 
 
-def crop_resize(img: np.ndarray, size: tuple[int, int] = (32, 32)) -> np.ndarray:
+def crop_resize(img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     # Expected img shape = (height, width, channels)
     height, width = img.shape[:2]
     crop_size = min(height, width)
@@ -43,8 +43,10 @@ def crop_resize(img: np.ndarray, size: tuple[int, int] = (32, 32)) -> np.ndarray
     return resized_img
 
 
-def normalise_batch(samples: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    data = np.array([crop_resize(image, (64, 64)) for image in samples["image"]]).astype(np.float32)
+def normalise_batch(
+    samples: dict[str, np.ndarray], size: tuple[int, int] = (32, 32)
+) -> dict[str, np.ndarray]:
+    data = np.array([crop_resize(image, size) for image in samples["image"]]).astype(np.float32)
     normalised_data = ((data / 255.0) - 0.5) / 0.5
     samples["image"] = normalised_data
     return samples
@@ -95,7 +97,7 @@ def train_mnist(num_epochs: int):
         num_features=128,
         latent_features=4,
         rngs=init_rngs,
-        resolution=32,
+        resolution=64,
         feature_multipliers=(1, 2, 4),
         double_latent_features=True,
     )
@@ -104,7 +106,7 @@ def train_mnist(num_epochs: int):
         num_features=128,
         out_features=3,
         rngs=init_rngs,
-        resolution=32,
+        resolution=64,
         feature_multipliers=(1, 2, 4),
     )
     vae = VariationalAutoEncoder(
@@ -115,7 +117,7 @@ def train_mnist(num_epochs: int):
 
     train_dataset, validation_dataset = (
         ray.data.read_images("data/oxford_flowers", override_num_blocks=12)
-        .map_batches(normalise_batch)
+        .map_batches(normalise_batch, fn_kwargs={"size": (64, 64)})
         .random_shuffle(seed=42)
         .train_test_split(test_size=0.1)
     )
