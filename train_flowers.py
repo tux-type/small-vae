@@ -9,6 +9,7 @@ logging.getLogger("ray.data").setLevel(logging.WARNING)
 
 ray.init(num_cpus=12, num_gpus=1)
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import jax
@@ -22,6 +23,35 @@ from tqdm import tqdm
 
 from vae.modules import Decoder, Encoder
 from vae.vae import VariationalAutoEncoder
+
+
+@dataclass()
+class HyperParameters:
+    # Training
+    learning_rate: float = 5e-6
+    batch_size: int = 32
+    epochs: int = 200
+
+    # Loss
+    beta: float = 0.0001
+
+    # Models
+    in_features: int = 3
+    num_features: int = 128
+    latent_features: int = 4
+    out_features: int = 3
+    feature_multipliers: tuple[int, ...] = (1, 2, 4)
+
+    # Data
+    resolution: int = 64
+    test_size: float = 0.1
+    prefetch_batches: int = 2
+
+    # Seeds
+    init_seed: int = 0
+    training_seed: int = 1
+    sampling_seed: int = 2
+    shuffle_seed: int = 42
 
 
 def crop_resize(img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
@@ -70,9 +100,10 @@ def train_step(
     metrics: nnx.MultiMetric,
     rngs: nnx.Rngs,
     x: jax.Array,
+    hparams: HyperParameters,
 ):
     grad_fn = nnx.value_and_grad(f=loss_fn, has_aux=True)
-    (loss, aux_data), grads = grad_fn(model, x, rngs, beta=0.0001)
+    (loss, aux_data), grads = grad_fn(model, x, rngs, beta=hparams.beta)
     kl_loss, recon_loss, predictions = aux_data
     metrics.update(loss=loss, kl_loss=kl_loss, recon_loss=recon_loss)
     optimiser.update(grads)
@@ -87,27 +118,27 @@ def save_sample_images(path: str, original_images: jax.Array, reconstructed_imag
     matplotlib.image.imsave(path, concat_images)
 
 
-def train_mnist(num_epochs: int):
-    init_rngs = nnx.Rngs(params=0)
-    training_rngs = nnx.Rngs(latent=1)
-    sampling_rngs = nnx.Rngs(latent=2)
+def train_mnist(hparams: HyperParameters):
+    init_rngs = nnx.Rngs(params=hparams.init_seed)
+    training_rngs = nnx.Rngs(latent=hparams.training_seed)
+    sampling_rngs = nnx.Rngs(latent=hparams.sampling_seed)
 
     encoder = Encoder(
-        in_features=3,
-        num_features=128,
-        latent_features=4,
+        in_features=hparams.in_features,
+        num_features=hparams.num_features,
+        latent_features=hparams.latent_features,
         rngs=init_rngs,
-        resolution=64,
-        feature_multipliers=(1, 2, 4),
+        resolution=hparams.resolution,
+        feature_multipliers=hparams.feature_multipliers,
         double_latent_features=True,
     )
     decoder = Decoder(
-        latent_features=4,
-        num_features=128,
-        out_features=3,
+        latent_features=hparams.latent_features,
+        num_features=hparams.num_features,
+        out_features=hparams.out_features,
         rngs=init_rngs,
-        resolution=64,
-        feature_multipliers=(1, 2, 4),
+        resolution=hparams.resolution,
+        feature_multipliers=hparams.feature_multipliers,
     )
     vae = VariationalAutoEncoder(
         encoder=encoder,
@@ -117,12 +148,12 @@ def train_mnist(num_epochs: int):
 
     train_dataset, validation_dataset = (
         ray.data.read_images("data/oxford_flowers", override_num_blocks=12)
-        .map_batches(normalise_batch, fn_kwargs={"size": (64, 64)})
-        .random_shuffle(seed=42)
-        .train_test_split(test_size=0.1)
+        .map_batches(normalise_batch, fn_kwargs={"size": (hparams.resolution, hparams.resolution)})
+        .random_shuffle(seed=hparams.shuffle_seed)
+        .train_test_split(test_size=hparams.test_size)
     )
 
-    optimiser = nnx.Optimizer(vae, optax.adam(5e-6))
+    optimiser = nnx.Optimizer(vae, optax.adam(hparams.learning_rate))
     metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),
         kl_loss=nnx.metrics.Average("kl_loss"),
@@ -131,16 +162,19 @@ def train_mnist(num_epochs: int):
 
     metrics_history = {"loss": [], "kl_loss": [], "recon_loss": []}
 
-    for epoch in range(num_epochs):
+    for epoch in range(hparams.epochs):
         train_dataset = train_dataset.random_shuffle().materialize()
         progress_bar = tqdm(
             train_dataset.iter_batches(
-                prefetch_batches=1, batch_size=32, batch_format="numpy", drop_last=True
+                prefetch_batches=hparams.prefetch_batches,
+                batch_size=hparams.batch_size,
+                batch_format="numpy",
+                drop_last=True,
             )
         )
         for batch in progress_bar:
             x = jnp.array(batch["image"])
-            train_step(vae, optimiser, metrics, training_rngs, x)
+            train_step(vae, optimiser, metrics, training_rngs, x, hparams=hparams)
 
             for metric, value in metrics.compute().items():
                 metrics_history[metric].append(value)
@@ -151,7 +185,7 @@ def train_mnist(num_epochs: int):
                 f"loss: {loss:.4f} kl_loss: {kl_loss:.4f} recon_loss: {recon_loss:.4f}"
             )
 
-        if epoch % 5 == 0 or epoch == (num_epochs - 1):
+        if epoch % 5 == 0 or epoch == (hparams.epochs - 1):
             print(f"Sampling Epoch: {epoch}")
             x = jnp.array(train_dataset.take_batch(8, batch_format="numpy")["image"])
             x_hat = vae.reconstruct(x)
@@ -179,4 +213,27 @@ def train_mnist(num_epochs: int):
 
 
 if __name__ == "__main__":
-    train_mnist(num_epochs=200)
+    hparams = HyperParameters(
+        # Training
+        learning_rate=5e-6,
+        batch_size=32,
+        epochs=200,
+        # Loss
+        beta=0.0001,
+        # Models
+        in_features=3,
+        num_features=128,
+        latent_features=4,
+        out_features=3,
+        feature_multipliers=(1, 2, 4),
+        # Data
+        resolution=64,
+        test_size=0.1,
+        prefetch_batches=2,
+        # Seeds
+        init_seed=0,
+        training_seed=1,
+        sampling_seed=2,
+        shuffle_seed=42,
+    )
+    train_mnist(hparams)
