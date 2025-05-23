@@ -19,13 +19,14 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from flax import nnx
+from jaxlpips import LPIPS
 from tqdm import tqdm
 
 from vae.modules import Decoder, Encoder
 from vae.vae import VariationalAutoEncoder
 
 
-@dataclass()
+@dataclass(frozen=True)
 class HyperParameters:
     # Training
     learning_rate: float = 5e-6
@@ -33,7 +34,8 @@ class HyperParameters:
     epochs: int = 200
 
     # Loss
-    beta: float = 0.0001
+    perceptual_scale: float = 0.5
+    kl_scale: float = 0.0001
 
     # Models
     in_features: int = 3
@@ -83,29 +85,48 @@ def normalise_batch(
 
 
 def loss_fn(
-    model: VariationalAutoEncoder, x: jax.Array, rngs: nnx.Rngs, beta: float
+    model: VariationalAutoEncoder,
+    x: jax.Array,
+    rngs: nnx.Rngs,
+    perceptual_loss_fn: LPIPS,
+    perceptual_scale: float,
+    kl_scale: float,
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
     posterior, predictions = model(x, rngs)
+
     kl = -0.5 * jnp.sum(1 + posterior.logvar - (posterior.mean**2) - posterior.var, axis=(1, 2, 3))
     kl_loss = kl.sum() / x.shape[0]
-    recon_loss = optax.squared_error(predictions=predictions, targets=x).mean()
-    loss = beta * kl_loss + recon_loss
-    return loss, (kl_loss, recon_loss, predictions)
+    recon_loss = optax.squared_error(predictions=predictions, targets=x)
+    perceptual_loss = perceptual_loss_fn(x, predictions)
+
+    recon_perc_loss = recon_loss + (perceptual_scale * perceptual_loss)
+    recon_perc_loss = recon_perc_loss.sum() / recon_perc_loss.shape[0]
+
+    loss = recon_perc_loss + kl_scale * kl_loss
+    return loss, (kl_loss, recon_loss.mean(), perceptual_loss, predictions)
 
 
-@nnx.jit
+@nnx.jit(static_argnums=6, static_argnames="config")
 def train_step(
     model: VariationalAutoEncoder,
     optimiser: nnx.Optimizer,
     metrics: nnx.MultiMetric,
     rngs: nnx.Rngs,
     x: jax.Array,
-    hparams: HyperParameters,
+    perceptual_loss_fn: LPIPS,
+    config: HyperParameters,
 ):
     grad_fn = nnx.value_and_grad(f=loss_fn, has_aux=True)
-    (loss, aux_data), grads = grad_fn(model, x, rngs, beta=hparams.beta)
-    kl_loss, recon_loss, predictions = aux_data
-    metrics.update(loss=loss, kl_loss=kl_loss, recon_loss=recon_loss)
+    (loss, aux_data), grads = grad_fn(
+        model,
+        x,
+        rngs,
+        perceptual_loss_fn,
+        perceptual_scale=config.perceptual_scale,
+        kl_scale=config.kl_scale,
+    )
+    kl_loss, recon_loss, percep_loss, predictions = aux_data
+    metrics.update(loss=loss, kl_loss=kl_loss, recon_loss=recon_loss, percep_loss=percep_loss)
     optimiser.update(grads)
 
 
@@ -118,27 +139,27 @@ def save_sample_images(path: str, original_images: jax.Array, reconstructed_imag
     matplotlib.image.imsave(path, concat_images)
 
 
-def train_mnist(hparams: HyperParameters):
-    init_rngs = nnx.Rngs(params=hparams.init_seed)
-    training_rngs = nnx.Rngs(latent=hparams.training_seed)
-    sampling_rngs = nnx.Rngs(latent=hparams.sampling_seed)
+def train_mnist(config: HyperParameters):
+    init_rngs = nnx.Rngs(params=config.init_seed)
+    training_rngs = nnx.Rngs(latent=config.training_seed)
+    sampling_rngs = nnx.Rngs(latent=config.sampling_seed)
 
     encoder = Encoder(
-        in_features=hparams.in_features,
-        num_features=hparams.num_features,
-        latent_features=hparams.latent_features,
+        in_features=config.in_features,
+        num_features=config.num_features,
+        latent_features=config.latent_features,
         rngs=init_rngs,
-        resolution=hparams.resolution,
-        feature_multipliers=hparams.feature_multipliers,
+        resolution=config.resolution,
+        feature_multipliers=config.feature_multipliers,
         double_latent_features=True,
     )
     decoder = Decoder(
-        latent_features=hparams.latent_features,
-        num_features=hparams.num_features,
-        out_features=hparams.out_features,
+        latent_features=config.latent_features,
+        num_features=config.num_features,
+        out_features=config.out_features,
         rngs=init_rngs,
-        resolution=hparams.resolution,
-        feature_multipliers=hparams.feature_multipliers,
+        resolution=config.resolution,
+        feature_multipliers=config.feature_multipliers,
     )
     vae = VariationalAutoEncoder(
         encoder=encoder,
@@ -146,46 +167,52 @@ def train_mnist(hparams: HyperParameters):
         device=jax.devices("gpu")[0],
     )
 
+    # Model for perceptual loss
+    lpips = LPIPS(pretrained_network="vgg16")
+    lpips.eval()
+
     train_dataset, validation_dataset = (
         ray.data.read_images("data/oxford_flowers", override_num_blocks=12)
-        .map_batches(normalise_batch, fn_kwargs={"size": (hparams.resolution, hparams.resolution)})
-        .random_shuffle(seed=hparams.shuffle_seed)
-        .train_test_split(test_size=hparams.test_size)
+        .map_batches(normalise_batch, fn_kwargs={"size": (config.resolution, config.resolution)})
+        .random_shuffle(seed=config.shuffle_seed)
+        .train_test_split(test_size=config.test_size)
     )
 
-    optimiser = nnx.Optimizer(vae, optax.adam(hparams.learning_rate))
+    optimiser = nnx.Optimizer(vae, optax.adam(config.learning_rate))
     metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),
         kl_loss=nnx.metrics.Average("kl_loss"),
         recon_loss=nnx.metrics.Average("recon_loss"),
+        percep_loss=nnx.metrics.Average("percep_loss"),
     )
 
-    metrics_history = {"loss": [], "kl_loss": [], "recon_loss": []}
+    metrics_history = {"loss": [], "kl_loss": [], "recon_loss": [], "percep_loss": []}
 
-    for epoch in range(hparams.epochs):
+    for epoch in range(config.epochs):
         train_dataset = train_dataset.random_shuffle().materialize()
         progress_bar = tqdm(
             train_dataset.iter_batches(
-                prefetch_batches=hparams.prefetch_batches,
-                batch_size=hparams.batch_size,
+                prefetch_batches=config.prefetch_batches,
+                batch_size=config.batch_size,
                 batch_format="numpy",
                 drop_last=True,
             )
         )
         for batch in progress_bar:
             x = jnp.array(batch["image"])
-            train_step(vae, optimiser, metrics, training_rngs, x, hparams=hparams)
+            train_step(vae, optimiser, metrics, training_rngs, x, lpips, config=config)
 
             for metric, value in metrics.compute().items():
                 metrics_history[metric].append(value)
             loss = metrics_history["loss"][-1]
             kl_loss = metrics_history["kl_loss"][-1]
             recon_loss = metrics_history["recon_loss"][-1]
+            percep_loss = metrics_history["percep_loss"][-1]
             progress_bar.set_description(
-                f"loss: {loss:.4f} kl_loss: {kl_loss:.4f} recon_loss: {recon_loss:.4f}"
+                f"loss: {loss:.4f} kl_loss: {kl_loss:.4f} recon_loss: {recon_loss:.4f} percep_loss: {percep_loss:.4f}"
             )
 
-        if epoch % 5 == 0 or epoch == (hparams.epochs - 1):
+        if epoch % 5 == 0 or epoch == (config.epochs - 1):
             print(f"Sampling Epoch: {epoch}")
             x = jnp.array(train_dataset.take_batch(8, batch_format="numpy")["image"])
             x_hat = vae.reconstruct(x)
@@ -213,13 +240,14 @@ def train_mnist(hparams: HyperParameters):
 
 
 if __name__ == "__main__":
-    hparams = HyperParameters(
+    config = HyperParameters(
         # Training
         learning_rate=5e-6,
         batch_size=32,
         epochs=200,
         # Loss
-        beta=0.0001,
+        perceptual_scale=0.5,
+        kl_scale=0.0001,
         # Models
         in_features=3,
         num_features=128,
@@ -236,4 +264,4 @@ if __name__ == "__main__":
         sampling_seed=2,
         shuffle_seed=42,
     )
-    train_mnist(hparams)
+    train_mnist(config)
