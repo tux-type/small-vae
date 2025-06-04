@@ -39,7 +39,6 @@ def vae_loss_fn(
     perceptual_loss_fn: LPIPS,
     perceptual_scale: float,
     kl_scale: float,
-    **kwargs,
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
     recon_perc_loss, (posterior, predictions, recon_loss, perceptual_loss) = reconstruction_loss(
         model=model,
@@ -81,19 +80,24 @@ def vae_with_gan_loss_fn(
         diff_state = nnx.DiffState(0, decoder_filter)
 
         recon_grad_fn = nnx.value_and_grad(reconstruction_loss, argnums=diff_state, has_aux=True)
-        (recon_perc_loss, aux_data), recon_grad = recon_grad_fn(model, x, rngs)
+        (recon_perc_loss, aux_data), recon_grad = recon_grad_fn(
+            model, x, rngs, perceptual_loss_fn, perceptual_scale
+        )
         (posterior, predictions, recon_loss, perceptual_loss) = aux_data
 
         # TODO: Trying two passes to see if JIT compiler is smart enough to only do 1 pass
         # https://github.com/google/flax/discussions/3316
         def gan_loss_fn_fwd(
-            model: VariationalAutoEncoder, discriminator: Discriminator, x: jax.Array
+            model: VariationalAutoEncoder,
+            discriminator: Discriminator,
+            x: jax.Array,
+            rngs: nnx.Rngs,
         ):
             _, predictions = model(x, rngs)
             return gan_loss_fn(discriminator, predictions)
 
         gan_grad_fn = nnx.value_and_grad(gan_loss_fn_fwd, argnums=diff_state, has_aux=False)
-        adversarial_loss, gan_grad = gan_grad_fn(model, x, rngs)
+        adversarial_loss, gan_grad = gan_grad_fn(model, discriminator, x, rngs)
 
         adversarial_weight = jnp.clip(
             optax.global_norm(recon_grad) / (optax.global_norm(gan_grad) + 1e-4),
