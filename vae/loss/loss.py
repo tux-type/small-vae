@@ -39,6 +39,7 @@ def vae_loss_fn(
     perceptual_loss_fn: LPIPS,
     perceptual_scale: float,
     kl_scale: float,
+    **kwargs,
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
     recon_perc_loss, (posterior, predictions, recon_loss, perceptual_loss) = reconstruction_loss(
         model=model,
@@ -52,7 +53,7 @@ def vae_loss_fn(
     kl_loss = kl_loss_fn(posterior, x)
 
     loss = recon_perc_loss + kl_scale * kl_loss
-    return loss, (kl_loss, recon_loss, perceptual_loss, predictions)
+    return loss, (kl_loss, recon_loss, perceptual_loss, jnp.zeros(()), predictions)
 
 
 def gan_loss_fn(discriminator: Discriminator, predictions: jax.Array) -> jax.Array:
