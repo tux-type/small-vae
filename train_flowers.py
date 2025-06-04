@@ -11,6 +11,7 @@ ray.init(num_cpus=12, num_gpus=1)
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +23,8 @@ from flax import nnx
 from jaxlpips import LPIPS
 from tqdm import tqdm
 
+from vae.loss.discriminator import Discriminator
+from vae.loss.loss import discriminator_loss_fn, vae_loss_fn, vae_with_gan_loss_fn
 from vae.modules import Decoder, Encoder
 from vae.vae import VariationalAutoEncoder
 
@@ -32,10 +35,13 @@ class HyperParameters:
     learning_rate: float = 5e-6
     batch_size: int = 32
     epochs: int = 200
+    gan_start_epoch: int = 20
 
     # Loss
     perceptual_scale: float = 0.5
     kl_scale: float = 0.0001
+    adversarial_scale: float = 0.5
+    disc_scale: float = 1.0
 
     # Models
     in_features: int = 3
@@ -84,49 +90,55 @@ def normalise_batch(
     return samples
 
 
-def loss_fn(
-    model: VariationalAutoEncoder,
-    x: jax.Array,
-    rngs: nnx.Rngs,
-    perceptual_loss_fn: LPIPS,
-    perceptual_scale: float,
-    kl_scale: float,
-) -> tuple[jax.Array, tuple[jax.Array, ...]]:
-    posterior, predictions = model(x, rngs)
-
-    kl = -0.5 * jnp.sum(1 + posterior.logvar - (posterior.mean**2) - posterior.var, axis=(1, 2, 3))
-    kl_loss = kl.sum() / x.shape[0]
-    recon_loss = optax.squared_error(predictions=predictions, targets=x)
-    perceptual_loss = perceptual_loss_fn(x, predictions)
-
-    recon_perc_loss = recon_loss + (perceptual_scale * perceptual_loss)
-    recon_perc_loss = recon_perc_loss.sum() / recon_perc_loss.shape[0]
-
-    loss = recon_perc_loss + kl_scale * kl_loss
-    return loss, (kl_loss, recon_loss.mean(), perceptual_loss, predictions)
-
-
-@nnx.jit(static_argnums=6, static_argnames="config")
+@nnx.jit(static_argnums=8, static_argnames="config")
 def train_step(
     model: VariationalAutoEncoder,
     optimiser: nnx.Optimizer,
     metrics: nnx.MultiMetric,
     rngs: nnx.Rngs,
     x: jax.Array,
+    loss_fn: Callable,
     perceptual_loss_fn: LPIPS,
     config: HyperParameters,
-):
+    discriminator: Discriminator | None = None,
+) -> jax.Array:
     grad_fn = nnx.value_and_grad(f=loss_fn, has_aux=True)
     (loss, aux_data), grads = grad_fn(
         model,
-        x,
-        rngs,
-        perceptual_loss_fn,
+        x=x,
+        rngs=rngs,
+        perceptual_loss_fn=perceptual_loss_fn,
         perceptual_scale=config.perceptual_scale,
         kl_scale=config.kl_scale,
+        adversarial_scale=config.adversarial_scale,
+        discriminator=discriminator,
+        training=True,
     )
-    kl_loss, recon_loss, percep_loss, predictions = aux_data
-    metrics.update(loss=loss, kl_loss=kl_loss, recon_loss=recon_loss, percep_loss=percep_loss)
+    kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions = aux_data
+    metrics.update(
+        loss=loss,
+        kl_loss=kl_loss,
+        recon_loss=recon_loss,
+        percep_loss=perceptual_loss,
+        adversarial_loss=adversarial_loss,
+    )
+    optimiser.update(grads)
+    return predictions
+
+
+@nnx.jit(static_argnums=6)
+def train_step_gan(
+    discriminator: Discriminator,
+    optimiser: nnx.Optimizer,
+    metrics: nnx.MultiMetric,
+    x: jax.Array,
+    predictions: jax.Array,
+    loss_fn: Callable,
+    config: HyperParameters,
+):
+    grad_fn = nnx.value_and_grad(f=loss_fn, has_aux=False)
+    loss, grads = grad_fn(discriminator, x, predictions, config.disc_scale)
+    metrics.update(disc_loss=loss)
     optimiser.update(grads)
 
 
@@ -166,6 +178,7 @@ def train_mnist(config: HyperParameters):
         decoder=decoder,
         device=jax.devices("gpu")[0],
     )
+    discriminator = Discriminator(in_features=3, num_features=64, rngs=init_rngs)
 
     # Model for perceptual loss
     lpips = LPIPS(pretrained_network="vgg16")
@@ -179,6 +192,7 @@ def train_mnist(config: HyperParameters):
     )
 
     optimiser = nnx.Optimizer(vae, optax.adam(config.learning_rate))
+    optimiser_gan = nnx.Optimizer(discriminator, optax.adam(config.learning_rate))
     metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),
         kl_loss=nnx.metrics.Average("kl_loss"),
@@ -186,7 +200,14 @@ def train_mnist(config: HyperParameters):
         percep_loss=nnx.metrics.Average("percep_loss"),
     )
 
-    metrics_history = {"loss": [], "kl_loss": [], "recon_loss": [], "percep_loss": []}
+    metrics_history = {
+        "loss": [],
+        "kl_loss": [],
+        "recon_loss": [],
+        "percep_loss": [],
+        "adversarial_loss": [],
+        "disc_loss": [],
+    }
 
     for epoch in range(config.epochs):
         train_dataset = train_dataset.random_shuffle().materialize()
@@ -200,16 +221,49 @@ def train_mnist(config: HyperParameters):
         )
         for batch in progress_bar:
             x = jnp.array(batch["image"])
-            train_step(vae, optimiser, metrics, training_rngs, x, lpips, config=config)
+            if epoch < config.gan_start_epoch:
+                predictions = train_step(
+                    vae,
+                    optimiser,
+                    metrics,
+                    training_rngs,
+                    x,
+                    loss_fn=vae_loss_fn,
+                    perceptual_loss_fn=lpips,
+                    config=config,
+                )
+            else:
+                predictions = train_step(
+                    vae,
+                    optimiser,
+                    metrics,
+                    training_rngs,
+                    x,
+                    loss_fn=vae_with_gan_loss_fn,
+                    perceptual_loss_fn=lpips,
+                    config=config,
+                    discriminator=discriminator,
+                )
+                train_step_gan(
+                    discriminator,
+                    optimiser_gan,
+                    metrics,
+                    x,
+                    predictions,
+                    discriminator_loss_fn,
+                    config=config,
+                )
 
             for metric, value in metrics.compute().items():
                 metrics_history[metric].append(value)
             loss = metrics_history["loss"][-1]
             kl_loss = metrics_history["kl_loss"][-1]
             recon_loss = metrics_history["recon_loss"][-1]
+            adversarial_loss = metrics_history["adversarial_loss"][-1]
             percep_loss = metrics_history["percep_loss"][-1]
+            disc_loss = metrics_history["disc_loss"][-1]
             progress_bar.set_description(
-                f"loss: {loss:.4f} kl_loss: {kl_loss:.4f} recon_loss: {recon_loss:.4f} percep_loss: {percep_loss:.4f}"
+                f"loss: {loss:.4f} kl_loss: {kl_loss:.4f} recon_loss: {recon_loss:.4f} percep_loss: {percep_loss:.4f} adversarial_loss: {adversarial_loss:.4f} disc_loss: {disc_loss:.4}"
             )
 
         if epoch % 5 == 0 or epoch == (config.epochs - 1):
@@ -245,9 +299,12 @@ if __name__ == "__main__":
         learning_rate=5e-6,
         batch_size=32,
         epochs=200,
+        gan_start_epoch=20,
         # Loss
         perceptual_scale=0.5,
         kl_scale=0.0001,
+        adversarial_scale=0.5,
+        disc_scale=1.0,
         # Models
         in_features=3,
         num_features=128,
