@@ -9,6 +9,7 @@ logging.getLogger("ray.data").setLevel(logging.WARNING)
 
 ray.init(num_cpus=12, num_gpus=1)
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import jax
@@ -18,10 +19,46 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 from flax import nnx
+from jaxlpips import LPIPS
 from tqdm import tqdm
 
+from vae.loss.discriminator import Discriminator
+from vae.loss.loss import discriminator_loss_fn, vae_loss_fn, vae_with_gan_loss_fn
 from vae.modules import Decoder, Encoder
 from vae.vae import VariationalAutoEncoder
+
+
+@dataclass(frozen=True)
+class HyperParameters:
+    # Training
+    learning_rate: float = 5e-6
+    batch_size: int = 32
+    epochs: int = 200
+    gan_start_epoch: int = 20
+
+    # Loss
+    perceptual_scale: float = 0.5
+    kl_scale: float = 0.0001
+    adversarial_scale: float = 0.5
+    disc_scale: float = 1.0
+
+    # Models
+    in_features: int = 3
+    num_features: int = 128
+    latent_features: int = 4
+    out_features: int = 3
+    feature_multipliers: tuple[int, ...] = (1, 2, 4)
+
+    # Data
+    resolution: int = 64
+    test_size: float = 0.1
+    prefetch_batches: int = 2
+
+    # Seeds
+    init_seed: int = 0
+    training_seed: int = 1
+    sampling_seed: int = 2
+    shuffle_seed: int = 42
 
 
 def crop_resize(img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
@@ -52,30 +89,68 @@ def normalise_batch(
     return samples
 
 
-def loss_fn(
-    model: VariationalAutoEncoder, x: jax.Array, rngs: nnx.Rngs, beta: float
-) -> tuple[jax.Array, tuple[jax.Array, ...]]:
-    posterior, predictions = model(x, rngs)
-    kl = -0.5 * jnp.sum(1 + posterior.logvar - (posterior.mean**2) - posterior.var, axis=(1, 2, 3))
-    kl_loss = kl.sum() / x.shape[0]
-    recon_loss = optax.squared_error(predictions=predictions, targets=x).mean()
-    loss = beta * kl_loss + recon_loss
-    return loss, (kl_loss, recon_loss, predictions)
-
-
-@nnx.jit
+@nnx.jit(static_argnums=5, static_argnames=("config"))
 def train_step(
     model: VariationalAutoEncoder,
     optimiser: nnx.Optimizer,
-    metrics: nnx.MultiMetric,
     rngs: nnx.Rngs,
     x: jax.Array,
-):
-    grad_fn = nnx.value_and_grad(f=loss_fn, has_aux=True)
-    (loss, aux_data), grads = grad_fn(model, x, rngs, beta=0.0001)
-    kl_loss, recon_loss, predictions = aux_data
-    metrics.update(loss=loss, kl_loss=kl_loss, recon_loss=recon_loss)
+    perceptual_loss_fn: LPIPS,
+    config: HyperParameters,
+) -> tuple[jax.Array, ...]:
+    grad_fn = nnx.value_and_grad(f=vae_loss_fn, has_aux=True)
+    (loss, aux_data), grads = grad_fn(
+        model,
+        x=x,
+        rngs=rngs,
+        perceptual_loss_fn=perceptual_loss_fn,
+        perceptual_scale=config.perceptual_scale,
+        kl_scale=config.kl_scale,
+    )
+    kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions = aux_data
     optimiser.update(grads)
+    return loss, kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions
+
+
+@nnx.jit(static_argnums=5, static_argnames=("config"))
+def train_step_with_gan_loss(
+    model: VariationalAutoEncoder,
+    optimiser: nnx.Optimizer,
+    rngs: nnx.Rngs,
+    x: jax.Array,
+    perceptual_loss_fn: LPIPS,
+    config: HyperParameters,
+    discriminator: Discriminator,
+) -> tuple[jax.Array, ...]:
+    grad_fn = nnx.value_and_grad(f=vae_with_gan_loss_fn, has_aux=True)
+    (loss, aux_data), grads = grad_fn(
+        model,
+        x=x,
+        rngs=rngs,
+        perceptual_loss_fn=perceptual_loss_fn,
+        perceptual_scale=config.perceptual_scale,
+        kl_scale=config.kl_scale,
+        adversarial_scale=config.adversarial_scale,
+        discriminator=discriminator,
+        training=True,
+    )
+    kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions = aux_data
+    optimiser.update(grads)
+    return loss, kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions
+
+
+@nnx.jit(static_argnums=4, static_argnames=("config"))
+def train_step_discriminator(
+    discriminator: Discriminator,
+    optimiser: nnx.Optimizer,
+    x: jax.Array,
+    predictions: jax.Array,
+    config: HyperParameters,
+) -> jax.Array:
+    grad_fn = nnx.value_and_grad(f=discriminator_loss_fn, has_aux=False)
+    loss, grads = grad_fn(discriminator, x, predictions, config.disc_scale)
+    optimiser.update(grads)
+    return loss
 
 
 def save_sample_images(path: str, original_images: jax.Array, reconstructed_images: jax.Array):
@@ -87,71 +162,129 @@ def save_sample_images(path: str, original_images: jax.Array, reconstructed_imag
     matplotlib.image.imsave(path, concat_images)
 
 
-def train_mnist(num_epochs: int):
-    init_rngs = nnx.Rngs(params=0)
-    training_rngs = nnx.Rngs(latent=1)
-    sampling_rngs = nnx.Rngs(latent=2)
+def train_mnist(config: HyperParameters):
+    init_rngs = nnx.Rngs(params=config.init_seed)
+    training_rngs = nnx.Rngs(latent=config.training_seed)
+    sampling_rngs = nnx.Rngs(latent=config.sampling_seed)
 
     encoder = Encoder(
-        in_features=3,
-        num_features=128,
-        latent_features=4,
+        in_features=config.in_features,
+        num_features=config.num_features,
+        latent_features=config.latent_features,
         rngs=init_rngs,
-        resolution=64,
-        feature_multipliers=(1, 2, 4),
+        resolution=config.resolution,
+        feature_multipliers=config.feature_multipliers,
         double_latent_features=True,
     )
     decoder = Decoder(
-        latent_features=4,
-        num_features=128,
-        out_features=3,
+        latent_features=config.latent_features,
+        num_features=config.num_features,
+        out_features=config.out_features,
         rngs=init_rngs,
-        resolution=64,
-        feature_multipliers=(1, 2, 4),
+        resolution=config.resolution,
+        feature_multipliers=config.feature_multipliers,
     )
     vae = VariationalAutoEncoder(
         encoder=encoder,
         decoder=decoder,
         device=jax.devices("gpu")[0],
     )
+    discriminator = Discriminator(in_features=3, num_features=64, rngs=init_rngs)
+
+    # Model for perceptual loss
+    lpips = LPIPS(pretrained_network="vgg16")
+    lpips.eval()
 
     train_dataset, validation_dataset = (
         ray.data.read_images("data/oxford_flowers", override_num_blocks=12)
-        .map_batches(normalise_batch, fn_kwargs={"size": (64, 64)})
-        .random_shuffle(seed=42)
-        .train_test_split(test_size=0.1)
+        .map_batches(normalise_batch, fn_kwargs={"size": (config.resolution, config.resolution)})
+        .random_shuffle(seed=config.shuffle_seed)
+        .train_test_split(test_size=config.test_size)
     )
 
-    optimiser = nnx.Optimizer(vae, optax.adam(5e-6))
+    optimiser = nnx.Optimizer(vae, optax.adam(config.learning_rate))
+    optimiser_gan = nnx.Optimizer(discriminator, optax.adam(config.learning_rate))
     metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),
         kl_loss=nnx.metrics.Average("kl_loss"),
         recon_loss=nnx.metrics.Average("recon_loss"),
+        percep_loss=nnx.metrics.Average("percep_loss"),
+        adversarial_loss=nnx.metrics.Average("adversarial_loss"),
+        disc_loss=nnx.metrics.Average("disc_loss"),
     )
 
-    metrics_history = {"loss": [], "kl_loss": [], "recon_loss": []}
+    metrics_history = {
+        "loss": [-1.0],
+        "kl_loss": [-1.0],
+        "recon_loss": [-1.0],
+        "percep_loss": [-1.0],
+        "adversarial_loss": [-1.0],
+        "disc_loss": [-1.0],
+    }
 
-    for epoch in range(num_epochs):
+    for epoch in range(config.epochs):
         train_dataset = train_dataset.random_shuffle().materialize()
         progress_bar = tqdm(
             train_dataset.iter_batches(
-                prefetch_batches=1, batch_size=32, batch_format="numpy", drop_last=True
+                prefetch_batches=config.prefetch_batches,
+                batch_size=config.batch_size,
+                batch_format="numpy",
+                drop_last=True,
             )
         )
         for batch in progress_bar:
             x = jnp.array(batch["image"])
-            train_step(vae, optimiser, metrics, training_rngs, x)
+            if epoch < config.gan_start_epoch:
+                loss, kl_loss, recon_loss, percep_loss, adversarial_loss, predictions = train_step(
+                    vae,
+                    optimiser,
+                    training_rngs,
+                    x,
+                    perceptual_loss_fn=lpips,
+                    config=config,
+                )
+                disc_loss = jnp.zeros(())
+            else:
+                loss, kl_loss, recon_loss, percep_loss, adversarial_loss, predictions = (
+                    train_step_with_gan_loss(
+                        vae,
+                        optimiser,
+                        training_rngs,
+                        x,
+                        perceptual_loss_fn=lpips,
+                        config=config,
+                        discriminator=discriminator,
+                    )
+                )
+                disc_loss = train_step_discriminator(
+                    discriminator,
+                    optimiser_gan,
+                    x,
+                    predictions,
+                    config=config,
+                )
 
+            metrics.update(
+                loss=loss,
+                kl_loss=kl_loss,
+                recon_loss=recon_loss,
+                percep_loss=percep_loss,
+                adversarial_loss=adversarial_loss,
+                disc_loss=disc_loss,
+            )
             for metric, value in metrics.compute().items():
                 metrics_history[metric].append(value)
             loss = metrics_history["loss"][-1]
             kl_loss = metrics_history["kl_loss"][-1]
             recon_loss = metrics_history["recon_loss"][-1]
+            adversarial_loss = metrics_history["adversarial_loss"][-1]
+            percep_loss = metrics_history["percep_loss"][-1]
+            disc_loss = metrics_history["disc_loss"][-1]
             progress_bar.set_description(
-                f"loss: {loss:.4f} kl_loss: {kl_loss:.4f} recon_loss: {recon_loss:.4f}"
+                f"loss: {loss:.4f} kl_loss: {kl_loss:.4f} recon_loss: {recon_loss:.4f} percep_loss: {percep_loss:.4f} adversarial_loss: {adversarial_loss:.4f} disc_loss: {disc_loss:.4f}"
             )
 
-        if epoch % 5 == 0 or epoch == (num_epochs - 1):
+        if epoch % 5 == 0 or epoch == (config.epochs - 1):
             print(f"Sampling Epoch: {epoch}")
             x = jnp.array(train_dataset.take_batch(8, batch_format="numpy")["image"])
             x_hat = vae.reconstruct(x)
@@ -179,4 +312,31 @@ def train_mnist(num_epochs: int):
 
 
 if __name__ == "__main__":
-    train_mnist(num_epochs=200)
+    config = HyperParameters(
+        # Training
+        learning_rate=3.75e-6,
+        batch_size=24,
+        epochs=200,
+        gan_start_epoch=20,
+        # Loss
+        perceptual_scale=0.5,
+        kl_scale=0.0001,
+        adversarial_scale=0.5,
+        disc_scale=1.0,
+        # Models
+        in_features=3,
+        num_features=128,
+        latent_features=4,
+        out_features=3,
+        feature_multipliers=(1, 2, 4),
+        # Data
+        resolution=64,
+        test_size=0.1,
+        prefetch_batches=2,
+        # Seeds
+        init_seed=0,
+        training_seed=1,
+        sampling_seed=2,
+        shuffle_seed=42,
+    )
+    train_mnist(config)
