@@ -1,5 +1,7 @@
-# Simple VAE-KL
+# Small VAE-GAN
 Work-in-progress.
+
+A small VAE-GAN with KL regularised latent space.
 
 ## Samples
 Flowers 200 Epochs
