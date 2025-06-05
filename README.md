@@ -1,7 +1,7 @@
-# Small VAE-GAN
+# Small VAE
 Work-in-progress.
 
-A small VAE-GAN with KL regularised latent space.
+A small VAE with KL regularised latent space trained with adversarial loss.
 
 ## Samples
 Flowers 200 Epochs
