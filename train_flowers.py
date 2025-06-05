@@ -314,10 +314,10 @@ def train_mnist(config: HyperParameters):
 if __name__ == "__main__":
     config = HyperParameters(
         # Training
-        learning_rate=5e-6,
-        batch_size=32,
+        learning_rate=3.75e-6,
+        batch_size=24,
         epochs=200,
-        gan_start_epoch=1,
+        gan_start_epoch=20,
         # Loss
         perceptual_scale=0.5,
         kl_scale=0.0001,
