@@ -5,11 +5,11 @@ from flax import nnx
 from jaxlpips import LPIPS
 
 from vae.loss.discriminator import Discriminator
-from vae.modules import GaussianPosterior
-from vae.vae import VariationalAutoEncoder
+from vae.model.modules import GaussianPosterior
+from vae.model.vae import VariationalAutoEncoder
 
 
-def reconstruction_loss(
+def reconstruction_loss_fn(
     model: VariationalAutoEncoder,
     x: jax.Array,
     rngs: nnx.Rngs,
@@ -17,7 +17,7 @@ def reconstruction_loss(
     perceptual_scale: float,
 ) -> tuple[jax.Array, tuple[GaussianPosterior, jax.Array, jax.Array, jax.Array]]:
     posterior, predictions = model(x, rngs)
-    recon_loss = optax.squared_error(predictions=predictions, targets=x)
+    recon_loss = jnp.abs(predictions - x)
 
     perceptual_loss = perceptual_loss_fn(x, predictions)
 
@@ -40,7 +40,7 @@ def vae_loss_fn(
     perceptual_scale: float,
     kl_scale: float,
 ) -> tuple[jax.Array, tuple[jax.Array, ...]]:
-    recon_perc_loss, (posterior, predictions, recon_loss, perceptual_loss) = reconstruction_loss(
+    recon_perc_loss, (posterior, predictions, recon_loss, perceptual_loss) = reconstruction_loss_fn(
         model=model,
         x=x,
         rngs=rngs,
@@ -79,7 +79,7 @@ def vae_with_gan_loss_fn(
         )
         diff_state = nnx.DiffState(0, decoder_filter)
 
-        recon_grad_fn = nnx.value_and_grad(reconstruction_loss, argnums=diff_state, has_aux=True)
+        recon_grad_fn = nnx.value_and_grad(reconstruction_loss_fn, argnums=diff_state, has_aux=True)
         (recon_perc_loss, aux_data), recon_grad = recon_grad_fn(
             model, x, rngs, perceptual_loss_fn, perceptual_scale
         )
@@ -107,7 +107,7 @@ def vae_with_gan_loss_fn(
         adversarial_weight = jax.lax.stop_gradient(adversarial_weight)
 
     else:
-        recon_perc_loss, aux_data = reconstruction_loss(
+        recon_perc_loss, aux_data = reconstruction_loss_fn(
             model, x, rngs, perceptual_loss_fn=perceptual_loss_fn, perceptual_scale=perceptual_scale
         )
         (posterior, predictions, recon_loss, perceptual_loss) = aux_data
