@@ -1,5 +1,4 @@
 import jax
-import jax.numpy as jnp
 from flax import nnx
 
 
@@ -81,5 +80,3 @@ class UpBlock(nnx.Module):
         out = jax.image.resize(x, shape=(B, H * 2, W * 2, C), method="nearest")
         out = self.conv(out)
         return out
-
-

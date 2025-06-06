@@ -9,12 +9,10 @@ logging.getLogger("ray.data").setLevel(logging.WARNING)
 
 ray.init(num_cpus=12, num_gpus=1)
 
-from dataclasses import dataclass
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import matplotlib.image
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
@@ -23,42 +21,11 @@ from jaxlpips import LPIPS
 from tqdm import tqdm
 
 from vae.loss.discriminator import Discriminator
-from vae.loss.loss import discriminator_loss_fn, vae_loss_fn, vae_with_gan_loss_fn
-from vae.modules import Decoder, Encoder
-from vae.vae import VariationalAutoEncoder
-
-
-@dataclass(frozen=True)
-class HyperParameters:
-    # Training
-    learning_rate: float = 5e-6
-    batch_size: int = 32
-    epochs: int = 200
-    gan_start_epoch: int = 20
-
-    # Loss
-    perceptual_scale: float = 0.5
-    kl_scale: float = 0.0001
-    adversarial_scale: float = 0.5
-    disc_scale: float = 1.0
-
-    # Models
-    in_features: int = 3
-    num_features: int = 128
-    latent_features: int = 4
-    out_features: int = 3
-    feature_multipliers: tuple[int, ...] = (1, 2, 4)
-
-    # Data
-    resolution: int = 64
-    test_size: float = 0.1
-    prefetch_batches: int = 2
-
-    # Seeds
-    init_seed: int = 0
-    training_seed: int = 1
-    sampling_seed: int = 2
-    shuffle_seed: int = 42
+from vae.model.modules import Decoder, Encoder
+from vae.model.vae import VariationalAutoEncoder
+from vae.training.hyperparameters import HyperParameters
+from vae.training.train_steps import train_step, train_step_discriminator, train_step_with_gan_loss
+from vae.training.utils import save_sample_images
 
 
 def crop_resize(img: np.ndarray, size: tuple[int, int]) -> np.ndarray:
@@ -87,79 +54,6 @@ def normalise_batch(
     normalised_data = ((data / 255.0) - 0.5) / 0.5
     samples["image"] = normalised_data
     return samples
-
-
-@nnx.jit(static_argnums=5, static_argnames=("config"))
-def train_step(
-    model: VariationalAutoEncoder,
-    optimiser: nnx.Optimizer,
-    rngs: nnx.Rngs,
-    x: jax.Array,
-    perceptual_loss_fn: LPIPS,
-    config: HyperParameters,
-) -> tuple[jax.Array, ...]:
-    grad_fn = nnx.value_and_grad(f=vae_loss_fn, has_aux=True)
-    (loss, aux_data), grads = grad_fn(
-        model,
-        x=x,
-        rngs=rngs,
-        perceptual_loss_fn=perceptual_loss_fn,
-        perceptual_scale=config.perceptual_scale,
-        kl_scale=config.kl_scale,
-    )
-    kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions = aux_data
-    optimiser.update(grads)
-    return loss, kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions
-
-
-@nnx.jit(static_argnums=5, static_argnames=("config"))
-def train_step_with_gan_loss(
-    model: VariationalAutoEncoder,
-    optimiser: nnx.Optimizer,
-    rngs: nnx.Rngs,
-    x: jax.Array,
-    perceptual_loss_fn: LPIPS,
-    config: HyperParameters,
-    discriminator: Discriminator,
-) -> tuple[jax.Array, ...]:
-    grad_fn = nnx.value_and_grad(f=vae_with_gan_loss_fn, has_aux=True)
-    (loss, aux_data), grads = grad_fn(
-        model,
-        x=x,
-        rngs=rngs,
-        perceptual_loss_fn=perceptual_loss_fn,
-        perceptual_scale=config.perceptual_scale,
-        kl_scale=config.kl_scale,
-        adversarial_scale=config.adversarial_scale,
-        discriminator=discriminator,
-        training=True,
-    )
-    kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions = aux_data
-    optimiser.update(grads)
-    return loss, kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions
-
-
-@nnx.jit(static_argnums=4, static_argnames=("config"))
-def train_step_discriminator(
-    discriminator: Discriminator,
-    optimiser: nnx.Optimizer,
-    x: jax.Array,
-    predictions: jax.Array,
-    config: HyperParameters,
-) -> jax.Array:
-    grad_fn = nnx.value_and_grad(f=discriminator_loss_fn, has_aux=False)
-    loss, grads = grad_fn(discriminator, x, predictions, config.disc_scale)
-    optimiser.update(grads)
-    return loss
-
-
-def save_sample_images(path: str, original_images: jax.Array, reconstructed_images: jax.Array):
-    original_images = jnp.concatenate(original_images, axis=1)
-    reconstructed_images = jnp.concatenate(reconstructed_images, axis=1)
-    concat_images = jnp.concatenate((original_images, reconstructed_images), axis=0)
-    concat_images = ((concat_images + 1) * 127.5 + 0.5).clip(0, 255)
-    concat_images = np.array(concat_images.astype(jnp.uint8))
-    matplotlib.image.imsave(path, concat_images)
 
 
 def train_mnist(config: HyperParameters):
@@ -317,10 +211,10 @@ if __name__ == "__main__":
         learning_rate=3.75e-6,
         batch_size=24,
         epochs=200,
-        gan_start_epoch=20,
+        gan_start_epoch=25,
         # Loss
         perceptual_scale=0.5,
-        kl_scale=0.0001,
+        kl_scale=1e-5,
         adversarial_scale=0.5,
         disc_scale=1.0,
         # Models

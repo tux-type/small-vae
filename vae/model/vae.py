@@ -1,7 +1,7 @@
 import jax
 from flax import nnx
 
-from vae.modules import Decoder, Encoder, GaussianPosterior
+from vae.model.modules import Decoder, Encoder, GaussianPosterior
 
 
 class VariationalAutoEncoder(nnx.Module):

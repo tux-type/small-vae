@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from vae.blocks import ConvBlock, DownBlock, UpBlock
+from vae.model.blocks import ConvBlock, DownBlock, UpBlock
 
 
 class Encoder(nnx.Module):
