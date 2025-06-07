@@ -152,9 +152,10 @@ def train_mnist(config: HyperParameters):
                 )
                 disc_loss = train_step_discriminator(
                     discriminator,
+                    vae,
                     optimiser_gan,
                     x,
-                    predictions,
+                    training_rngs,
                     config=config,
                 )
 

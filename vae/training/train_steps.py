@@ -58,14 +58,16 @@ def train_step_with_gan_loss(
     return loss, kl_loss, recon_loss, perceptual_loss, adversarial_loss, predictions
 
 
-@nnx.jit(static_argnums=4, static_argnames=("config"))
+@nnx.jit(static_argnums=5, static_argnames=("config"))
 def train_step_discriminator(
     discriminator: Discriminator,
+    vae: VariationalAutoEncoder,
     optimiser: nnx.Optimizer,
     x: jax.Array,
-    predictions: jax.Array,
+    rngs: nnx.Rngs,
     config: HyperParameters,
 ) -> jax.Array:
+    _, predictions = vae(x, rngs)
     grad_fn = nnx.value_and_grad(f=discriminator_loss_fn, has_aux=False)
     loss, grads = grad_fn(discriminator, x, predictions, config.disc_scale)
     optimiser.update(grads)
