@@ -56,7 +56,7 @@ def normalise_batch(
     return samples
 
 
-def train_mnist(config: HyperParameters):
+def train_flowers(config: HyperParameters):
     init_rngs = nnx.Rngs(params=config.init_seed)
     training_rngs = nnx.Rngs(latent=config.training_seed)
     sampling_rngs = nnx.Rngs(latent=config.sampling_seed)
@@ -234,4 +234,4 @@ if __name__ == "__main__":
         sampling_seed=2,
         shuffle_seed=42,
     )
-    train_mnist(config)
+    train_flowers(config)
