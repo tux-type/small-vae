@@ -50,6 +50,7 @@ class ConvBlock(nnx.Module):
         residual = self.conv1(x)
         out = self.conv2(residual)
         if self.is_residual:
+            out = residual + out
             return out / 1.414
         else:
             return out
